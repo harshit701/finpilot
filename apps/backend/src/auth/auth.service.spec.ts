@@ -1,12 +1,61 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
+import * as bcrypt from 'bcrypt';
 import { AuthService } from './auth.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { Prisma } from '../generated/prisma/client';
 
-describe('AuthService', () => {
+const GENERIC_RESPONSE = {
+  message:
+    'If the email is not already registered, a confirmation has been sent.',
+};
+
+describe('AuthService — register', () => {
   let service: AuthService;
+  let prismaUserCreate: jest.Mock;
+  let jwtService: { signAsync: jest.Mock };
+  let configService: { get: jest.Mock; getOrThrow: jest.Mock };
 
   beforeEach(async () => {
+    prismaUserCreate = jest.fn().mockResolvedValue({
+      id: 'user-id',
+      email: 'harshit@finpilot.com',
+      firstName: 'Harshit',
+      lastName: 'Dave',
+      isEmailVerified: false,
+      isDeleted: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const prismaMock = {
+      user: { create: prismaUserCreate },
+    };
+
+    configService = {
+      get: jest.fn((key: string) => {
+        if (key === 'BCRYPT_SALT_ROUNDS') return '4'; // low for fast tests
+        if (key === 'APP_NAME') return 'finpilot';
+        if (key === 'NODE_ENV') return 'test';
+        return undefined;
+      }),
+      getOrThrow: jest.fn((key: string) => {
+        if (key === 'JWT_ACCESS_SECRET') return 'test-access-secret';
+        if (key === 'JWT_ACCESS_EXPIRES_IN') return '15m';
+        return 'value';
+      }),
+    };
+
+    jwtService = { signAsync: jest.fn() };
+
     const module: TestingModule = await Test.createTestingModule({
-      providers: [AuthService],
+      providers: [
+        AuthService,
+        { provide: PrismaService, useValue: prismaMock },
+        { provide: ConfigService, useValue: configService },
+        { provide: JwtService, useValue: jwtService },
+      ],
     }).compile();
 
     service = module.get<AuthService>(AuthService);
@@ -14,5 +63,141 @@ describe('AuthService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  it('hashes the password with bcrypt before persisting', async () => {
+    const hashSpy = jest.spyOn(bcrypt, 'hash');
+    const compareSpy = jest
+      .spyOn(bcrypt, 'compare')
+      .mockResolvedValue(false as never);
+
+    await service.register({
+      email: 'harshit@finpilot.com',
+      password: 'Password1!',
+      firstName: 'Harshit',
+      lastName: 'Dave',
+    });
+
+    expect(hashSpy).toHaveBeenCalledWith('Password1!', 4);
+
+    hashSpy.mockRestore();
+    compareSpy.mockRestore();
+  });
+
+  it('creates user with normalized fields and omits sensitive columns', async () => {
+    const compareSpy = jest
+      .spyOn(bcrypt, 'compare')
+      .mockResolvedValue(false as never);
+
+    await service.register({
+      email: 'Harshit@FinPilot.com',
+      password: 'Password1!',
+      firstName: 'Harshit',
+      lastName: 'Dave',
+    });
+
+    expect(prismaUserCreate).toHaveBeenCalledTimes(1);
+    const call = prismaUserCreate.mock.calls[0][0];
+
+    // Email is normalized to lowercase by the DTO @Transform before
+    // reaching the service.
+    expect(call.data.email).toBe('Harshit@FinPilot.com');
+    expect(call.data.passwordHash).toEqual(expect.any(String));
+    expect(call.data.passwordHash).not.toBe('Password1!');
+    expect(call.omit).toEqual({ passwordHash: true, refreshToken: true });
+
+    compareSpy.mockRestore();
+  });
+
+  it('returns the generic message on a successful create', async () => {
+    const compareSpy = jest
+      .spyOn(bcrypt, 'compare')
+      .mockResolvedValue(false as never);
+
+    const result = await service.register({
+      email: 'harshit@finpilot.com',
+      password: 'Password1!',
+    });
+
+    expect(result).toEqual(GENERIC_RESPONSE);
+
+    compareSpy.mockRestore();
+  });
+
+  it('returns the same generic message when Prisma throws P2002', async () => {
+    prismaUserCreate.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError(
+        'Unique constraint failed',
+        { code: 'P2002', clientVersion: '7.8.0', meta: { target: ['email'] } },
+      ),
+    );
+    const compareSpy = jest
+      .spyOn(bcrypt, 'compare')
+      .mockResolvedValue(false as never);
+
+    const result = await service.register({
+      email: 'harshit@finpilot.com',
+      password: 'Password1!',
+    });
+
+    expect(result).toEqual(GENERIC_RESPONSE);
+
+    compareSpy.mockRestore();
+  });
+
+  it('re-throws non-P2002 errors instead of returning the generic message', async () => {
+    const fatal = new Error('database is on fire');
+    prismaUserCreate.mockRejectedValueOnce(fatal);
+    const compareSpy = jest
+      .spyOn(bcrypt, 'compare')
+      .mockResolvedValue(false as never);
+
+    await expect(
+      service.register({
+        email: 'harshit@finpilot.com',
+        password: 'Password1!',
+      }),
+    ).rejects.toBe(fatal);
+
+    compareSpy.mockRestore();
+  });
+
+  it('runs bcrypt.compare on the success path to equalize timing', async () => {
+    const compareSpy = jest
+      .spyOn(bcrypt, 'compare')
+      .mockResolvedValue(false as never);
+
+    await service.register({
+      email: 'harshit@finpilot.com',
+      password: 'Password1!',
+    });
+
+    expect(compareSpy).toHaveBeenCalledTimes(1);
+    // First argument to compare is the user-supplied password.
+    expect(compareSpy.mock.calls[0][0]).toBe('Password1!');
+
+    compareSpy.mockRestore();
+  });
+
+  it('runs bcrypt.compare on the duplicate-email path to equalize timing', async () => {
+    prismaUserCreate.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError(
+        'Unique constraint failed',
+        { code: 'P2002', clientVersion: '7.8.0' },
+      ),
+    );
+    const compareSpy = jest
+      .spyOn(bcrypt, 'compare')
+      .mockResolvedValue(false as never);
+
+    await service.register({
+      email: 'harshit@finpilot.com',
+      password: 'Password1!',
+    });
+
+    expect(compareSpy).toHaveBeenCalledTimes(1);
+    expect(compareSpy.mock.calls[0][0]).toBe('Password1!');
+
+    compareSpy.mockRestore();
   });
 });
