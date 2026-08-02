@@ -4,6 +4,8 @@ import { AuthService } from './auth.service';
 import { PrismaModule } from '../prisma/prisma.module';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { JwtStrategy } from './strategies/jwt.strategy';
+import type { StringValue } from 'ms';
 
 @Module({
   imports: [
@@ -13,14 +15,14 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
       inject: [ConfigService],
 
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_ACCESS_SECRET'),
+        secret: config.getOrThrow<string>('JWT_ACCESS_SECRET'),
         signOptions: {
-          expiresIn: Number(config.get<number>('JWT_ACCESS_EXPIRATION')),
+          expiresIn: config.getOrThrow<StringValue>('JWT_ACCESS_EXPIRES_IN'),
         },
       }),
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService],
+  providers: [AuthService, JwtStrategy],
 })
 export class AuthModule {}
