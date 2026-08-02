@@ -11,6 +11,8 @@ import * as bcrypt from 'bcrypt';
 import { LoginUserDto } from './dto/login-user.dto';
 import { JwtService } from '@nestjs/jwt';
 import { JwtPayload } from './interfaces/jwt-payload.interface';
+import type { StringValue } from 'ms';
+import { RefreshTokenDto } from './dto/refresh-token.dto';
 
 @Injectable()
 export class AuthService {
@@ -19,15 +21,12 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
   ) {}
-  async healthCheck() {
-    const result = await this.prisma.user.count();
-
+  healthCheck() {
     return {
       service: this.configService.get<string>('APP_NAME'),
       status: 'healthy',
       timestamp: new Date().toISOString(),
       environment: this.configService.get<string>('NODE_ENV'),
-      userCount: result,
     };
   }
 
@@ -70,6 +69,12 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
+    if (!user.isEmailVerified) {
+      throw new BadRequestException(
+        'Please verify your email before logging in.',
+      );
+    }
+
     const isPasswordMatch = await this.comparePasswords(
       password,
       user.passwordHash,
@@ -79,17 +84,68 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
-    if (!user.isEmailVerified) {
-      throw new BadRequestException(
-        'Please verify your email before logging in.',
-      );
-    }
-
     const tokens = await this.generateTokens(user);
 
     await this.saveRefreshTokenHash(user.id, tokens.refreshToken);
 
     return tokens;
+  }
+
+  me(user: JwtPayload) {
+    return {
+      user,
+    };
+  }
+
+  async logout(userId: string) {
+    await this.prisma.user.update({
+      where: {
+        id: userId,
+      },
+      data: {
+        refreshToken: null,
+      },
+    });
+
+    return {
+      message: 'Logged out successfully',
+    };
+  }
+
+  async refresh(refreshTokenDto: RefreshTokenDto) {
+    const { refresh_token } = refreshTokenDto;
+
+    const payload = await this.verifyRefreshToken(refresh_token);
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.id },
+      omit: {
+        passwordHash: true,
+      },
+    });
+
+    if (!user || user.isDeleted || !user.refreshToken) {
+      throw new UnauthorizedException('Invalid Refresh Token');
+    }
+
+    try {
+      const isValid = await this.validateRefreshToken(
+        refresh_token,
+        user.refreshToken as string,
+      );
+
+      if (!isValid) {
+        throw new UnauthorizedException('Invalid Refresh Token');
+      }
+
+      const tokens = await this.generateTokens(payload);
+
+      await this.saveRefreshTokenHash(user.id, tokens.refreshToken);
+
+      return tokens;
+    } catch {
+      throw new UnauthorizedException('Invalid Refresh Token');
+    }
   }
 
   private async findUserByEmail(email: string) {
@@ -112,18 +168,18 @@ export class AuthService {
   }
 
   private async generateAccessToken(user: JwtPayload) {
-    const payload = { sub: user.id, email: user.email };
+    const payload = { id: user.id, email: user.email };
 
     return this.jwtService.signAsync(payload);
   }
 
   private async generateRefreshToken(user: JwtPayload) {
-    const payload = { sub: user.id, email: user.email };
+    const payload = { id: user.id, email: user.email };
 
     return this.jwtService.signAsync(payload, {
-      secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
-      expiresIn: Number(
-        this.configService.get<string>('JWT_REFRESH_EXPIRES_IN'),
+      secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
+      expiresIn: this.configService.getOrThrow<StringValue>(
+        'JWT_REFRESH_EXPIRES_IN',
       ),
     });
   }
@@ -151,5 +207,26 @@ export class AuthService {
         refreshToken: refreshTokenHash,
       },
     });
+  }
+
+  private async verifyRefreshToken(refreshToken: string) {
+    try {
+      return await this.jwtService.verifyAsync<JwtPayload>(refreshToken, {
+        secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
+      });
+    } catch {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+  }
+
+  private async validateRefreshToken(
+    refreshToken: string,
+    refreshTokenHash: string | null,
+  ) {
+    if (!refreshTokenHash) {
+      return false;
+    }
+
+    return bcrypt.compare(refreshToken, refreshTokenHash);
   }
 }
