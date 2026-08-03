@@ -163,24 +163,50 @@ export class AuthService {
       throw new UnauthorizedException('Invalid Refresh Token');
     }
 
-    try {
-      const isValid = await this.validateRefreshToken(
-        refresh_token,
-        user.refreshToken as string,
-      );
+    const isValid = await this.validateRefreshToken(
+      refresh_token,
+      user.refreshToken,
+    );
 
-      if (!isValid) {
-        throw new UnauthorizedException('Invalid Refresh Token');
-      }
-
-      const tokens = await this.generateTokens(payload);
-
-      await this.saveRefreshTokenHash(user.id, tokens.refreshToken);
-
-      return tokens;
-    } catch {
+    if (!isValid) {
       throw new UnauthorizedException('Invalid Refresh Token');
     }
+
+    // Re-derive the email from the database so the new access token reflects
+    // the user's current email rather than the value baked into the refresh
+    // token at sign-in time.
+    const tokens = await this.generateTokens({
+      id: user.id,
+      email: user.email,
+    });
+
+    const newRefreshTokenHash = await this.hashPassword(tokens.refreshToken);
+
+    // Atomic rotation: optimistic lock on the existing refresh-token hash.
+    // If two concurrent refresh requests both pass `validateRefreshToken`
+    // against the same old hash, only the first `updateMany` will match the
+    // WHERE clause; the second sees `count === 0` (the hash was already
+    // overwritten) and is rejected. This eliminates the silent-loss race
+    // that the previous read-then-write flow had.
+    //
+    // `isDeleted: false` in the WHERE clause is belt-and-braces against the
+    // user being soft-deleted between the load and the update.
+    const updateResult = await this.prisma.user.updateMany({
+      where: {
+        id: user.id,
+        isDeleted: false,
+        refreshToken: user.refreshToken,
+      },
+      data: {
+        refreshToken: newRefreshTokenHash,
+      },
+    });
+
+    if (updateResult.count === 0) {
+      throw new UnauthorizedException('Invalid Refresh Token');
+    }
+
+    return tokens;
   }
 
   private async findUserByEmail(email: string) {
