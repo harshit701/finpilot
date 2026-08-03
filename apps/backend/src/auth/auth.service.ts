@@ -1,11 +1,11 @@
 import {
   BadRequestException,
-  ConflictException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
+import { Prisma } from '../generated/prisma/client';
 import { RegisterUserDto } from './dto/register-user.dto';
 import * as bcrypt from 'bcrypt';
 import { LoginUserDto } from './dto/login-user.dto';
@@ -13,6 +13,18 @@ import { JwtService } from '@nestjs/jwt';
 import { JwtPayload } from './interfaces/jwt-payload.interface';
 import type { StringValue } from 'ms';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
+
+/**
+ * Response message returned by /auth/register.
+ *
+ * Intentionally identical for success, duplicate-email, and any other
+ * non-error outcome. The endpoint must not leak whether an email is
+ * already registered (defense against user-enumeration attacks).
+ */
+const REGISTER_GENERIC_RESPONSE = {
+  message:
+    'If the email is not already registered, a confirmation has been sent.',
+};
 
 @Injectable()
 export class AuthService {
@@ -33,31 +45,48 @@ export class AuthService {
   async register(registerUserDto: RegisterUserDto) {
     const { email, password, firstName, lastName } = registerUserDto;
 
-    const existingUser = await this.findUserByEmail(email);
-
-    if (existingUser) {
-      throw new ConflictException('User already exists');
-    }
-
     const passwordHash = await this.hashPassword(password);
 
-    const user = await this.prisma.user.create({
-      data: {
-        email,
-        passwordHash,
-        firstName,
-        lastName,
-      },
-      omit: {
-        passwordHash: true,
-        refreshToken: true,
-      },
-    });
+    // Equalize timing on the response so an attacker cannot distinguish
+    // "email not registered" from "email already registered" by measuring
+    // the duration of /auth/register. The dummy compare is a real bcrypt
+    // comparison whose result we discard; it adds the same amount of work
+    // to the success path as the failure path.
+    const dummyHash = await this.getDummyPasswordHash();
+    const equalize = bcrypt.compare(password, dummyHash);
 
-    return {
-      message: 'User registered successfully',
-      user,
-    };
+    try {
+      await this.prisma.user.create({
+        data: {
+          email,
+          passwordHash,
+          firstName,
+          lastName,
+        },
+        omit: {
+          passwordHash: true,
+          refreshToken: true,
+        },
+      });
+    } catch (err) {
+      const isUniqueViolation =
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002';
+
+      // Wait for the dummy compare regardless of branch so the two paths
+      // take the same wall-clock time before responding.
+      await equalize;
+
+      if (isUniqueViolation) {
+        return REGISTER_GENERIC_RESPONSE;
+      }
+
+      throw err;
+    }
+
+    await equalize;
+
+    return REGISTER_GENERIC_RESPONSE;
   }
 
   async login(loginUserDto: LoginUserDto) {
@@ -65,7 +94,13 @@ export class AuthService {
 
     const user = await this.findUserByEmail(email);
 
+    // Equalize timing on the user-missing branch. The dummy compare is
+    // a real bcrypt comparison whose result we discard.
+    const dummyHash = await this.getDummyPasswordHash();
+    const equalize = bcrypt.compare(password, dummyHash);
+
     if (!user || user.isDeleted) {
+      await equalize;
       throw new UnauthorizedException('Invalid email or password');
     }
 
@@ -165,6 +200,27 @@ export class AuthService {
 
   private async comparePasswords(password: string, hashedPassword: string) {
     return bcrypt.compare(password, hashedPassword);
+  }
+
+  /**
+   * Lazily-computed bcrypt hash used to equalize timing on /auth/register.
+   * The plaintext is deliberately not a real password. The hash is never
+   * persisted and is only used for a one-shot bcrypt.compare that we await
+   * to consume CPU cycles.
+   */
+  private dummyPasswordHashPromise?: Promise<string>;
+
+  private async getDummyPasswordHash(): Promise<string> {
+    if (!this.dummyPasswordHashPromise) {
+      const saltRounds = Number(
+        this.configService.get<string>('BCRYPT_SALT_ROUNDS'),
+      );
+      this.dummyPasswordHashPromise = bcrypt.hash(
+        'timing-equalization-only-not-a-real-password',
+        saltRounds,
+      );
+    }
+    return this.dummyPasswordHashPromise;
   }
 
   private async generateAccessToken(user: JwtPayload) {
