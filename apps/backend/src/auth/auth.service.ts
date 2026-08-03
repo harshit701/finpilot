@@ -94,7 +94,13 @@ export class AuthService {
 
     const user = await this.findUserByEmail(email);
 
+    // Equalize timing on the user-missing branch. The dummy compare is
+    // a real bcrypt comparison whose result we discard.
+    const dummyHash = await this.getDummyPasswordHash();
+    const equalize = bcrypt.compare(password, dummyHash);
+
     if (!user || user.isDeleted) {
+      await equalize;
       throw new UnauthorizedException('Invalid email or password');
     }
 
