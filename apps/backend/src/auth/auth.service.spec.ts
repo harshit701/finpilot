@@ -1,23 +1,45 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import * as bcrypt from 'bcrypt';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client';
+
+// Mock bcrypt as a whole module. `jest.spyOn(bcrypt, '...')` cannot
+// redefine the named exports of `bcrypt` under Jest 30 (its ESM-style
+// module loader treats them as read-only), so each test configures the
+// shared mock implementation explicitly via the factory below.
+jest.mock('bcrypt', () => ({
+  hash: jest.fn(),
+  compare: jest.fn(),
+}));
+
+import * as bcrypt from 'bcrypt';
 
 const GENERIC_RESPONSE = {
   message:
     'If the email is not already registered, a confirmation has been sent.',
 };
 
+const hashMock = bcrypt.hash as unknown as jest.Mock;
+const compareMock = bcrypt.compare as unknown as jest.Mock;
+
 describe('AuthService — register', () => {
   let service: AuthService;
   let prismaUserCreate: jest.Mock;
-  let jwtService: { signAsync: jest.Mock };
   let configService: { get: jest.Mock; getOrThrow: jest.Mock };
+  let jwtService: { signAsync: jest.Mock };
 
   beforeEach(async () => {
+    hashMock.mockReset();
+    compareMock.mockReset();
+
+    // Default behavior: hash returns a deterministic stubbed hash so we
+    // can assert it was passed through; compare resolves false so the
+    // dummy-completion branch resolves quickly.
+    hashMock.mockImplementation(async (plain: string) => `hashed:${plain}`);
+    compareMock.mockResolvedValue(false);
+
     prismaUserCreate = jest.fn().mockResolvedValue({
       id: 'user-id',
       email: 'harshit@finpilot.com',
@@ -66,11 +88,6 @@ describe('AuthService — register', () => {
   });
 
   it('hashes the password with bcrypt before persisting', async () => {
-    const hashSpy = jest.spyOn(bcrypt, 'hash');
-    const compareSpy = jest
-      .spyOn(bcrypt, 'compare')
-      .mockResolvedValue(false as never);
-
     await service.register({
       email: 'harshit@finpilot.com',
       password: 'Password1!',
@@ -78,17 +95,10 @@ describe('AuthService — register', () => {
       lastName: 'Dave',
     });
 
-    expect(hashSpy).toHaveBeenCalledWith('Password1!', 4);
-
-    hashSpy.mockRestore();
-    compareSpy.mockRestore();
+    expect(hashMock).toHaveBeenCalledWith('Password1!', 4);
   });
 
   it('creates user with normalized fields and omits sensitive columns', async () => {
-    const compareSpy = jest
-      .spyOn(bcrypt, 'compare')
-      .mockResolvedValue(false as never);
-
     await service.register({
       email: 'Harshit@FinPilot.com',
       password: 'Password1!',
@@ -105,23 +115,15 @@ describe('AuthService — register', () => {
     expect(call.data.passwordHash).toEqual(expect.any(String));
     expect(call.data.passwordHash).not.toBe('Password1!');
     expect(call.omit).toEqual({ passwordHash: true, refreshToken: true });
-
-    compareSpy.mockRestore();
   });
 
   it('returns the generic message on a successful create', async () => {
-    const compareSpy = jest
-      .spyOn(bcrypt, 'compare')
-      .mockResolvedValue(false as never);
-
     const result = await service.register({
       email: 'harshit@finpilot.com',
       password: 'Password1!',
     });
 
     expect(result).toEqual(GENERIC_RESPONSE);
-
-    compareSpy.mockRestore();
   });
 
   it('returns the same generic message when Prisma throws P2002', async () => {
@@ -131,9 +133,6 @@ describe('AuthService — register', () => {
         { code: 'P2002', clientVersion: '7.8.0', meta: { target: ['email'] } },
       ),
     );
-    const compareSpy = jest
-      .spyOn(bcrypt, 'compare')
-      .mockResolvedValue(false as never);
 
     const result = await service.register({
       email: 'harshit@finpilot.com',
@@ -141,16 +140,11 @@ describe('AuthService — register', () => {
     });
 
     expect(result).toEqual(GENERIC_RESPONSE);
-
-    compareSpy.mockRestore();
   });
 
   it('re-throws non-P2002 errors instead of returning the generic message', async () => {
     const fatal = new Error('database is on fire');
     prismaUserCreate.mockRejectedValueOnce(fatal);
-    const compareSpy = jest
-      .spyOn(bcrypt, 'compare')
-      .mockResolvedValue(false as never);
 
     await expect(
       service.register({
@@ -158,25 +152,17 @@ describe('AuthService — register', () => {
         password: 'Password1!',
       }),
     ).rejects.toBe(fatal);
-
-    compareSpy.mockRestore();
   });
 
   it('runs bcrypt.compare on the success path to equalize timing', async () => {
-    const compareSpy = jest
-      .spyOn(bcrypt, 'compare')
-      .mockResolvedValue(false as never);
-
     await service.register({
       email: 'harshit@finpilot.com',
       password: 'Password1!',
     });
 
-    expect(compareSpy).toHaveBeenCalledTimes(1);
+    expect(compareMock).toHaveBeenCalledTimes(1);
     // First argument to compare is the user-supplied password.
-    expect(compareSpy.mock.calls[0][0]).toBe('Password1!');
-
-    compareSpy.mockRestore();
+    expect(compareMock.mock.calls[0][0]).toBe('Password1!');
   });
 
   it('runs bcrypt.compare on the duplicate-email path to equalize timing', async () => {
@@ -186,18 +172,13 @@ describe('AuthService — register', () => {
         { code: 'P2002', clientVersion: '7.8.0' },
       ),
     );
-    const compareSpy = jest
-      .spyOn(bcrypt, 'compare')
-      .mockResolvedValue(false as never);
 
     await service.register({
       email: 'harshit@finpilot.com',
       password: 'Password1!',
     });
 
-    expect(compareSpy).toHaveBeenCalledTimes(1);
-    expect(compareSpy.mock.calls[0][0]).toBe('Password1!');
-
-    compareSpy.mockRestore();
+    expect(compareMock).toHaveBeenCalledTimes(1);
+    expect(compareMock.mock.calls[0][0]).toBe('Password1!');
   });
 });
