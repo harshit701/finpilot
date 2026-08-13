@@ -1,9 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import { UnauthorizedException } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client';
+import { SessionsService } from '../sessions/sessions.service';
 
 // Mock bcrypt as a whole module. `jest.spyOn(bcrypt, '...')` cannot
 // redefine the named exports of `bcrypt` under Jest 30 (its ESM-style
@@ -77,6 +79,17 @@ describe('AuthService — register', () => {
         { provide: PrismaService, useValue: prismaMock },
         { provide: ConfigService, useValue: configService },
         { provide: JwtService, useValue: jwtService },
+        {
+          provide: SessionsService,
+          useValue: {
+            createSession: jest.fn(),
+            findByRawToken: jest.fn(),
+            rotate: jest.fn(),
+            revokeOne: jest.fn(),
+            revokeFamily: jest.fn(),
+            revokeAllForUser: jest.fn(),
+          },
+        },
       ],
     }).compile();
 
@@ -114,7 +127,7 @@ describe('AuthService — register', () => {
     expect(call.data.email).toBe('Harshit@FinPilot.com');
     expect(call.data.passwordHash).toEqual(expect.any(String));
     expect(call.data.passwordHash).not.toBe('Password1!');
-    expect(call.omit).toEqual({ passwordHash: true, refreshToken: true });
+    expect(call.omit).toEqual({ passwordHash: true });
   });
 
   it('returns the generic message on a successful create', async () => {
@@ -180,5 +193,311 @@ describe('AuthService — register', () => {
 
     expect(compareMock).toHaveBeenCalledTimes(1);
     expect(compareMock.mock.calls[0][0]).toBe('Password1!');
+  });
+});
+
+describe('AuthService — login', () => {
+  let service: AuthService;
+  let prismaUserFindUnique: jest.Mock;
+  let sessionsService: {
+    createSession: jest.Mock;
+    findByRawToken: jest.Mock;
+    rotate: jest.Mock;
+    revokeOne: jest.Mock;
+    revokeFamily: jest.Mock;
+    revokeAllForUser: jest.Mock;
+  };
+  let jwtService: { signAsync: jest.Mock; verifyAsync: jest.Mock };
+
+  const existingUser = {
+    id: 'user-id',
+    email: 'harshit@finpilot.com',
+    passwordHash: 'stored-hash',
+    isEmailVerified: false,
+    isDeleted: false,
+  };
+
+  beforeEach(async () => {
+    hashMock.mockReset();
+    compareMock.mockReset();
+    hashMock.mockImplementation((plain: string) => `hashed:${plain}`);
+
+    prismaUserFindUnique = jest.fn().mockResolvedValue(existingUser);
+
+    const prismaMock = {
+      user: { findUnique: prismaUserFindUnique },
+    };
+
+    const configService = {
+      get: jest.fn((key: string) => {
+        if (key === 'BCRYPT_SALT_ROUNDS') return '4';
+        return undefined;
+      }),
+      getOrThrow: jest.fn((key: string) => {
+        if (key === 'JWT_REFRESH_SECRET') return 'test-refresh-secret';
+        if (key === 'JWT_REFRESH_EXPIRES_IN') return '7d';
+        return 'value';
+      }),
+    };
+
+    jwtService = {
+      signAsync: jest.fn().mockResolvedValue('signed-token'),
+      verifyAsync: jest.fn(),
+    };
+
+    sessionsService = {
+      createSession: jest.fn().mockResolvedValue({ id: 'session-id' }),
+      findByRawToken: jest.fn(),
+      rotate: jest.fn(),
+      revokeOne: jest.fn(),
+      revokeFamily: jest.fn(),
+      revokeAllForUser: jest.fn(),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        AuthService,
+        { provide: PrismaService, useValue: prismaMock },
+        { provide: ConfigService, useValue: configService },
+        { provide: JwtService, useValue: jwtService },
+        { provide: SessionsService, useValue: sessionsService },
+      ],
+    }).compile();
+
+    service = module.get<AuthService>(AuthService);
+  });
+
+  it('logs in an unverified user without blocking on email verification', async () => {
+    compareMock.mockResolvedValue(true);
+
+    const result = await service.login({
+      email: 'harshit@finpilot.com',
+      password: 'Password1!',
+    });
+
+    expect(result).toEqual({
+      accessToken: 'signed-token',
+      refreshToken: 'signed-token',
+    });
+    expect(sessionsService.createSession).toHaveBeenCalledWith(
+      existingUser.id,
+      'signed-token',
+      expect.any(String),
+    );
+  });
+
+  it('throws Unauthorized on wrong password', async () => {
+    compareMock.mockResolvedValue(false);
+
+    await expect(
+      service.login({
+        email: 'harshit@finpilot.com',
+        password: 'WrongPassword1!',
+      }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+
+    expect(sessionsService.createSession).not.toHaveBeenCalled();
+  });
+
+  it('equalizes timing and throws Unauthorized when the user does not exist', async () => {
+    prismaUserFindUnique.mockResolvedValue(null);
+    compareMock.mockResolvedValue(false);
+
+    await expect(
+      service.login({
+        email: 'nobody@finpilot.com',
+        password: 'Password1!',
+      }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+
+    // The dummy compare (timing equalization) still ran on this branch.
+    expect(compareMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AuthService — refresh', () => {
+  let service: AuthService;
+  let prismaUserFindUnique: jest.Mock;
+  let sessionsService: {
+    createSession: jest.Mock;
+    findByRawToken: jest.Mock;
+    rotate: jest.Mock;
+    revokeOne: jest.Mock;
+    revokeFamily: jest.Mock;
+    revokeAllForUser: jest.Mock;
+  };
+  let jwtService: { signAsync: jest.Mock; verifyAsync: jest.Mock };
+
+  const user = {
+    id: 'user-id',
+    isEmailVerified: false,
+    isDeleted: false,
+  };
+
+  const validPayload = {
+    sub: 'user-id',
+    family_id: 'family-1',
+    jti: 'jti-1',
+  };
+
+  const activeSession = {
+    id: 'session-1',
+    userId: 'user-id',
+    familyId: 'family-1',
+    replacedById: null as string | null,
+    revokedAt: null as Date | null,
+    expiresAt: new Date(Date.now() + 1000 * 60 * 60),
+  };
+
+  beforeEach(async () => {
+    prismaUserFindUnique = jest.fn().mockResolvedValue(user);
+
+    const prismaMock = {
+      user: { findUnique: prismaUserFindUnique },
+    };
+
+    const configService = {
+      get: jest.fn(),
+      getOrThrow: jest.fn((key: string) => {
+        if (key === 'JWT_REFRESH_SECRET') return 'test-refresh-secret';
+        if (key === 'JWT_REFRESH_EXPIRES_IN') return '7d';
+        return 'value';
+      }),
+    };
+
+    jwtService = {
+      signAsync: jest.fn().mockResolvedValue('new-signed-token'),
+      verifyAsync: jest.fn().mockResolvedValue(validPayload),
+    };
+
+    sessionsService = {
+      createSession: jest.fn(),
+      findByRawToken: jest.fn().mockResolvedValue(activeSession),
+      rotate: jest.fn().mockResolvedValue({ id: 'session-2' }),
+      revokeOne: jest.fn(),
+      revokeFamily: jest.fn(),
+      revokeAllForUser: jest.fn(),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        AuthService,
+        { provide: PrismaService, useValue: prismaMock },
+        { provide: ConfigService, useValue: configService },
+        { provide: JwtService, useValue: jwtService },
+        { provide: SessionsService, useValue: sessionsService },
+      ],
+    }).compile();
+
+    service = module.get<AuthService>(AuthService);
+  });
+
+  it('rotates the session and returns a new token pair on the happy path', async () => {
+    const result = await service.refresh({ refresh_token: 'old-token' });
+
+    expect(result).toEqual({
+      accessToken: 'new-signed-token',
+      refreshToken: 'new-signed-token',
+    });
+    expect(sessionsService.rotate).toHaveBeenCalledWith(
+      activeSession,
+      user.id,
+      'new-signed-token',
+    );
+    expect(sessionsService.revokeFamily).not.toHaveBeenCalled();
+  });
+
+  it('rejects when the session has been revoked', async () => {
+    sessionsService.findByRawToken.mockResolvedValue({
+      ...activeSession,
+      revokedAt: new Date(),
+    });
+
+    await expect(
+      service.refresh({ refresh_token: 'old-token' }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('rejects when the session has expired', async () => {
+    sessionsService.findByRawToken.mockResolvedValue({
+      ...activeSession,
+      expiresAt: new Date(Date.now() - 1000),
+    });
+
+    await expect(
+      service.refresh({ refresh_token: 'old-token' }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('detects reuse of an already-rotated token and revokes the whole family', async () => {
+    sessionsService.findByRawToken.mockResolvedValue({
+      ...activeSession,
+      replacedById: 'session-2',
+    });
+
+    await expect(
+      service.refresh({ refresh_token: 'already-rotated-token' }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+
+    expect(sessionsService.revokeFamily).toHaveBeenCalledWith('family-1');
+    expect(sessionsService.rotate).not.toHaveBeenCalled();
+  });
+
+  it('rejects when the presented token fails signature/expiry verification', async () => {
+    jwtService.verifyAsync.mockRejectedValue(new Error('bad signature'));
+
+    await expect(
+      service.refresh({ refresh_token: 'tampered-token' }),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+
+    expect(sessionsService.findByRawToken).not.toHaveBeenCalled();
+  });
+});
+
+describe('AuthService — logout', () => {
+  let service: AuthService;
+  let sessionsService: {
+    createSession: jest.Mock;
+    findByRawToken: jest.Mock;
+    rotate: jest.Mock;
+    revokeOne: jest.Mock;
+    revokeFamily: jest.Mock;
+    revokeAllForUser: jest.Mock;
+  };
+
+  beforeEach(async () => {
+    sessionsService = {
+      createSession: jest.fn(),
+      findByRawToken: jest.fn(),
+      rotate: jest.fn(),
+      revokeOne: jest.fn(),
+      revokeFamily: jest.fn(),
+      revokeAllForUser: jest.fn(),
+    };
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        AuthService,
+        { provide: PrismaService, useValue: {} },
+        {
+          provide: ConfigService,
+          useValue: { get: jest.fn(), getOrThrow: jest.fn() },
+        },
+        {
+          provide: JwtService,
+          useValue: { signAsync: jest.fn(), verifyAsync: jest.fn() },
+        },
+        { provide: SessionsService, useValue: sessionsService },
+      ],
+    }).compile();
+
+    service = module.get<AuthService>(AuthService);
+  });
+
+  it('revokes exactly the session identified by the sid on the access token', async () => {
+    await service.logout('session-1');
+
+    expect(sessionsService.revokeOne).toHaveBeenCalledWith('session-1');
+    expect(sessionsService.revokeOne).toHaveBeenCalledTimes(1);
   });
 });

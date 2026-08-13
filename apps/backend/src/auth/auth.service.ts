@@ -1,18 +1,20 @@
-import {
-  BadRequestException,
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { Prisma } from '../generated/prisma/client';
+import { Prisma, User } from '../generated/prisma/client';
 import { RegisterUserDto } from './dto/register-user.dto';
 import * as bcrypt from 'bcrypt';
 import { LoginUserDto } from './dto/login-user.dto';
 import { JwtService } from '@nestjs/jwt';
-import { JwtPayload } from './interfaces/jwt-payload.interface';
+import {
+  JwtPayload,
+  RefreshTokenPayload,
+} from './interfaces/jwt-payload.interface';
 import type { StringValue } from 'ms';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
+import { SessionsService } from '../sessions/sessions.service';
+import type { AuthenticatedUser } from './types/authenticated-user.type';
 
 /**
  * Response message returned by /auth/register.
@@ -32,6 +34,7 @@ export class AuthService {
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
+    private readonly sessionsService: SessionsService,
   ) {}
   healthCheck() {
     return {
@@ -65,7 +68,6 @@ export class AuthService {
         },
         omit: {
           passwordHash: true,
-          refreshToken: true,
         },
       });
     } catch (err) {
@@ -104,12 +106,6 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
-    if (!user.isEmailVerified) {
-      throw new BadRequestException(
-        'Please verify your email before logging in.',
-      );
-    }
-
     const isPasswordMatch = await this.comparePasswords(
       password,
       user.passwordHash,
@@ -119,28 +115,26 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
-    const tokens = await this.generateTokens(user);
+    const familyId = randomUUID();
+    const refreshToken = await this.generateRefreshToken(user, familyId);
+    const session = await this.sessionsService.createSession(
+      user.id,
+      refreshToken,
+      familyId,
+    );
+    const accessToken = await this.generateAccessToken(user, session.id);
 
-    await this.saveRefreshTokenHash(user.id, tokens.refreshToken);
-
-    return tokens;
+    return { accessToken, refreshToken };
   }
 
-  me(user: JwtPayload) {
+  me(user: AuthenticatedUser) {
     return {
       user,
     };
   }
 
-  async logout(userId: string) {
-    await this.prisma.user.update({
-      where: {
-        id: userId,
-      },
-      data: {
-        refreshToken: null,
-      },
-    });
+  async logout(sessionId: string) {
+    await this.sessionsService.revokeOne(sessionId);
 
     return {
       message: 'Logged out successfully',
@@ -152,35 +146,47 @@ export class AuthService {
 
     const payload = await this.verifyRefreshToken(refresh_token);
 
+    const session = await this.sessionsService.findByRawToken(refresh_token);
+
+    if (
+      !session ||
+      session.revokedAt ||
+      session.expiresAt < new Date() ||
+      session.familyId !== payload.family_id
+    ) {
+      throw new UnauthorizedException('Invalid Refresh Token');
+    }
+
+    if (session.replacedById) {
+      // The token being presented was already rotated away once. The only
+      // explanation for it resurfacing is that two parties now hold a copy
+      // of it, so the whole rotation family is killed rather than guessing
+      // which party is legitimate.
+      await this.sessionsService.revokeFamily(session.familyId);
+      throw new UnauthorizedException('Invalid Refresh Token');
+    }
+
     const user = await this.prisma.user.findUnique({
-      where: { id: payload.id },
-      omit: {
-        passwordHash: true,
-      },
+      where: { id: payload.sub },
+      omit: { passwordHash: true },
     });
 
-    if (!user || user.isDeleted || !user.refreshToken) {
+    if (!user || user.isDeleted) {
       throw new UnauthorizedException('Invalid Refresh Token');
     }
 
-    try {
-      const isValid = await this.validateRefreshToken(
-        refresh_token,
-        user.refreshToken as string,
-      );
+    const newRefreshToken = await this.generateRefreshToken(
+      user,
+      session.familyId,
+    );
+    const newSession = await this.sessionsService.rotate(
+      session,
+      user.id,
+      newRefreshToken,
+    );
+    const accessToken = await this.generateAccessToken(user, newSession.id);
 
-      if (!isValid) {
-        throw new UnauthorizedException('Invalid Refresh Token');
-      }
-
-      const tokens = await this.generateTokens(payload);
-
-      await this.saveRefreshTokenHash(user.id, tokens.refreshToken);
-
-      return tokens;
-    } catch {
-      throw new UnauthorizedException('Invalid Refresh Token');
-    }
+    return { accessToken, refreshToken: newRefreshToken };
   }
 
   private async findUserByEmail(email: string) {
@@ -223,14 +229,25 @@ export class AuthService {
     return this.dummyPasswordHashPromise;
   }
 
-  private async generateAccessToken(user: JwtPayload) {
-    const payload = { id: user.id, email: user.email };
+  private async generateAccessToken(
+    user: Pick<User, 'id' | 'isEmailVerified'>,
+    sessionId: string,
+  ) {
+    const payload: Omit<JwtPayload, 'iat' | 'exp'> = {
+      sub: user.id,
+      sid: sessionId,
+      emailVerified: user.isEmailVerified,
+    };
 
     return this.jwtService.signAsync(payload);
   }
 
-  private async generateRefreshToken(user: JwtPayload) {
-    const payload = { id: user.id, email: user.email };
+  private async generateRefreshToken(user: Pick<User, 'id'>, familyId: string) {
+    const payload: Omit<RefreshTokenPayload, 'iat' | 'exp'> = {
+      sub: user.id,
+      family_id: familyId,
+      jti: randomUUID(),
+    };
 
     return this.jwtService.signAsync(payload, {
       secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
@@ -240,49 +257,18 @@ export class AuthService {
     });
   }
 
-  private async generateTokens(user: JwtPayload) {
-    const [accessToken, refreshToken] = await Promise.all([
-      this.generateAccessToken(user),
-      this.generateRefreshToken(user),
-    ]);
-
-    return {
-      accessToken,
-      refreshToken,
-    };
-  }
-
-  private async saveRefreshTokenHash(userId: string, refreshToken: string) {
-    const refreshTokenHash = await this.hashPassword(refreshToken);
-
-    await this.prisma.user.update({
-      where: {
-        id: userId,
-      },
-      data: {
-        refreshToken: refreshTokenHash,
-      },
-    });
-  }
-
-  private async verifyRefreshToken(refreshToken: string) {
+  private async verifyRefreshToken(
+    refreshToken: string,
+  ): Promise<RefreshTokenPayload> {
     try {
-      return await this.jwtService.verifyAsync<JwtPayload>(refreshToken, {
-        secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
-      });
+      return await this.jwtService.verifyAsync<RefreshTokenPayload>(
+        refreshToken,
+        {
+          secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
+        },
+      );
     } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
-  }
-
-  private async validateRefreshToken(
-    refreshToken: string,
-    refreshTokenHash: string | null,
-  ) {
-    if (!refreshTokenHash) {
-      return false;
-    }
-
-    return bcrypt.compare(refreshToken, refreshTokenHash);
   }
 }
