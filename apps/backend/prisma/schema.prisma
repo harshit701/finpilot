@@ -21,9 +21,29 @@ model User {
   passwordHash          String
   isEmailVerified       Boolean   @default(false)
   isDeleted             Boolean   @default(false)
-  refreshToken          String?
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
 
+  sessions              Session[]
+
   @@map("users")
+}
+
+model Session {
+  id           String    @id @default(uuid())
+  userId       String    @map("user_id")
+  tokenHash    String    @unique @map("token_hash")
+  familyId     String    @map("family_id")
+  replacedById String?   @unique @map("replaced_by_id")
+  expiresAt    DateTime  @map("expires_at")
+  revokedAt    DateTime? @map("revoked_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user         User      @relation(fields: [userId], references: [id])
+  replacedBy   Session?  @relation("SessionReplacement", fields: [replacedById], references: [id])
+  replacedFrom Session?  @relation("SessionReplacement")
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("sessions")
 }
